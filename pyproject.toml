@@ -41,3 +41,12 @@ Homepage = "https://rcap107.github.io/retrieve-merge-predict/"
 Repository = "https://github.com/rcap107/retrieve-merge-predict"
 
 [tool.uv]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[tool.pixi.pypi-dependencies]
+retrieve-merge-predict = { path = ".", editable = true }
+
+[tool.pixi.tasks]
