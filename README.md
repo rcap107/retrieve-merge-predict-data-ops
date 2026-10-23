@@ -66,16 +66,60 @@ format required by the pipeline.
 
 
 # Installing the requirements
-We recommend to use conda environments to fetch the required packages. File `environment.yaml` contains the
-required dependencies and allows to create directly a conda environment:
+There are two supported ways to set up the environment:
+
+### With pixi (recommended)
+The repository manifest defines two environments:
+`default` (full pipeline: catboost, pytabkit/torch, skrub, ...) and `analysis`
+(only plotting/notebook dependencies). The tasks for the different steps of
+the pipeline are predefined:
 ```
-conda env create --file=environment.yaml
-conda activate bench
+pixi install
+pixi run prepare-metadata PATH_DATA_FOLDER
+pixi run prepare-retrieval CONFIG_FILE
+pixi run query-indices CONFIG_FILE
+pixi run evaluate CONFIG_FILE
+pixi run parity-check
 ```
-Then, install the remaining dependencies with pip:
+The `analysis` environment can be used for the notebooks and plotting scripts:
 ```
-pip install -r requirements.txt
+pixi run -e analysis jupyter lab
 ```
+A `pixi.lock` file pins the exact versions used for reproducibility.
+
+### With uv (or any pip-based venv)
+```
+uv venv .venv
+uv pip install -e .
+```
+The `requirements.txt` and `environment.yaml` files contain the pinned
+versions used for the original experiments (python 3.10); they are kept for
+reference but they are not compatible with recent python versions.
+
+# Reproducibility: legacy vs DataOps engine
+The evaluation step can run with two interchangeable engines, selected with
+the `engine` key in the `[run_parameters]` section of the evaluation configs:
+- `engine = "legacy"` (default): the original implementation, with a manual
+  cross-validation loop.
+- `engine = "data_ops"`: the same evaluation expressed as a
+  [skrub DataOps](https://skrub-data.org/) plan; data preparation, splitting
+  and model training are handled by a `skrub.SkrubLearner`, while joins and
+  aggregations reuse the same code as the legacy engine.
+
+The two engines produce identical results (see `scripts/parity_check.py`,
+which compares them on identical data and splits). The log format is the same,
+so all analysis scripts work with either engine.
+
+An additional option, `plan_native_join` (boolean, default `false`), moves the
+join of all candidate tables for the `full_join` selector into a node of the
+DataOps plan. Note that, in this mode, the join/aggregation is executed once
+per fold on the training data (instead of separately on the inner train and
+validation splits), so the reported `time_join_train` is lower than with the
+legacy implementation while results are identical.
+
+Note that, as in the original implementation, neither the outer
+GroupShuffleSplit nor the inner train/validation split is seeded; runs are
+reproducible at the procedure level rather than bit-for-bit.
 
 # Downloading YADL
 It is possible to download YADL from [the zenodo repository](https://zenodo.org/records/12607873) 

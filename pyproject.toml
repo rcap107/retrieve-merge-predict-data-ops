@@ -8,28 +8,24 @@ name = "retrieve-merge-predict"
 version = "0.5"
 requires-python = ">=3.10"
 dependencies = [
-    "pip",
-    # "pandas==1.5.3",
-    # "numpy==1.24.3",
-    "woodwork==0.24.0",
-    # "scikit-learn==1.2.2",
-    "scipy==1.12.0",
-    "matplotlib==3.7.1",
-    "seaborn==0.12.2",
-    "gitpython==3.1.31",
-    "catboost==1.2",
-    "tqdm==4.65.0",
+    "woodwork>=0.24.0",
+    "scipy>=1.12.0",
+    "matplotlib>=3.7.1",
+    "seaborn>=0.12.2",
+    "gitpython>=3.1.31",
+    "catboost>=1.2",
+    "tqdm>=4.65.0",
     "jupyter",
-    "featuretools==1.26.0",
-    "pyarrow==12.0",
-    "pre-commit==3.4.0",
+    "featuretools>=1.26.0",
+    "pyarrow>=14.0",
+    "pre-commit>=3.4.0",
     "toml",
-    "datasketch==1.5.9",
-    "chardet==3.0.4",
-    "protobuf==3.20.3",
+    "datasketch>=1.5.9",
+    "chardet>=3.0.4",
+    "protobuf>=3.20.3",
     "lazo-index-service>=0.7.0",
-    "memory-profiler==0.61.0",
-    "clevercsv==0.8.2",
+    "memory-profiler>=0.61.0",
+    "clevercsv>=0.8.2",
     "polars-lts-cpu>=1.6.0",
     "skrub>=0.5.3",
     "pytabkit>=1.0.0",
@@ -46,7 +42,32 @@ Repository = "https://github.com/rcap107/retrieve-merge-predict"
 channels = ["conda-forge"]
 platforms = ["osx-arm64"]
 
-[tool.pixi.pypi-dependencies]
+[tool.pixi.dependencies]
+python = ">=3.12,<3.15"
+
+[tool.pixi.feature.eval.pypi-dependencies]
 retrieve-merge-predict = { path = ".", editable = true }
 
+[tool.pixi.feature.analysis.pypi-dependencies]
+numpy = "*"
+pandas = ">=2"
+polars = ">=1.6"
+pyarrow = ">=14"
+scikit-learn = ">=1.2"
+scipy = ">=1.12"
+matplotlib = ">=3.7"
+seaborn = ">=0.12"
+jupyter = "*"
+toml = "*"
+tqdm = "*"
+
+[tool.pixi.environments]
+default = { features = ["eval"], solve-group = "default" }
+analysis = { features = ["analysis"], solve-group = "default" }
+
 [tool.pixi.tasks]
+prepare-metadata = { cmd = "python scripts/preparation/metadata_creation.py", args = [ { arg = "path_data_folder" } ] }
+prepare-retrieval = { cmd = "python scripts/preparation/prepare_retrieval_methods.py", args = [ { arg = "config_file" } ] }
+query-indices = { cmd = "python query_indices.py", args = [ { arg = "config_file" } ] }
+evaluate = { cmd = "python main.py", args = [ { arg = "config", default = "config/evaluation/general/config-binary.toml" } ] }
+parity-check = { cmd = "python scripts/parity_check.py", args = [] }

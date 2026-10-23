@@ -40,7 +40,7 @@ from sklearn.preprocessing import (
     TargetEncoder,
 )
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
-from skrub import MinHashEncoder, TableVectorizer, tabular_learner
+from skrub import MinHashEncoder, TableVectorizer, tabular_pipeline
 from tqdm import tqdm
 
 import src.utils.joining as ju
@@ -517,7 +517,7 @@ class BaseJoinSelector(BaseEstimator):
         # X_enc = prep.transform(X)
         if self.task == "regression":
             if method == "rf":
-                self.inner_model = tabular_learner(RandomForestRegressor())
+                self.inner_model = tabular_pipeline(RandomForestRegressor())
         elif self.task == "classification":
             self.inner_model = RandomForestClassifier()
         else:

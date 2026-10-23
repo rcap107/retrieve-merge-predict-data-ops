@@ -33,7 +33,7 @@ def cast_features(table: pl.DataFrame):
     for col in table.columns:
         try:
             table = table.with_columns(pl.col(col).cast(pl.Float64))
-        except pl.ComputeError:
+        except (pl.ComputeError, pl.InvalidOperationError):
             table = table.with_columns(pl.col(col).cast(pl.Utf8))
     return table
 
@@ -156,7 +156,8 @@ def execute_join_with_aggregation(
             )
 
     # TODO: this will probably break when right_on contains more than one column, but I don't care for now
-    right_table = right_table.filter(pl.col(right_on).is_in(left_table[left_on]))
+    left_key = left_on[0] if isinstance(left_on, list) else left_on
+    right_table = right_table.filter(pl.col(right_on).is_in(left_table[left_key]))
 
     if aggregation == "dfs":
         merged = prepare_dfs_table(

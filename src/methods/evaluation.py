@@ -1,4 +1,5 @@
 """Evaluation methods"""
+
 import logging
 import os
 from pathlib import Path
@@ -44,6 +45,13 @@ def prepare_splits(run_parameters: dict, base_table: pl.DataFrame, group_column:
     split_kind = run_parameters["split_kind"]
     n_splits = run_parameters["n_splits"]
     test_size = run_parameters["test_size"]
+
+    # Optional precomputed splits (used for parity testing between the legacy
+    # and DataOps engines). Regular configurations never set this key.
+    precomputed_splits = run_parameters.get("_splits")
+    if precomputed_splits is not None:
+        return list(precomputed_splits)
+
     if split_kind == "group_shuffle":
         groups = base_table.select(
             pl.col(group_column).cast(pl.Categorical).to_physical().alias("group")
@@ -147,6 +155,22 @@ def evaluate_joins(
     Raises:
         ValueError: Raise ValueError if the number of provided estimators is 0.
     """
+    if run_parameters.get("engine", "legacy") == "data_ops":
+        # Imported here to avoid a circular import
+        from src.methods.data_ops_plan import evaluate_joins_data_ops
+
+        return evaluate_joins_data_ops(
+            scenario_logger=scenario_logger,
+            base_table=base_table,
+            join_candidates=join_candidates,
+            target_column=target_column,
+            group_column=group_column,
+            estim_parameters=estim_parameters,
+            join_parameters=join_parameters,
+            model_parameters=model_parameters,
+            run_parameters=run_parameters,
+        )
+
     splits = prepare_splits(run_parameters, base_table, group_column)
 
     estim_common_parameters = {

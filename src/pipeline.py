@@ -178,6 +178,13 @@ def validate_configuration(run_config: dict):
         "classification",
     ], f"Task {run_parameters['task']} not supported"
 
+    assert run_parameters.get("engine", "legacy") in [
+        "legacy",
+        "data_ops",
+    ], f"Engine {run_parameters.get('engine', 'legacy')} not supported"
+
+    assert run_parameters.get("plan_native_join", False) in [True, False]
+
     assert run_parameters["debug"] in [True, False]
 
     assert (
