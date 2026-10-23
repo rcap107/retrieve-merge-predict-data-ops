@@ -2,6 +2,7 @@ import datetime as dt
 import random
 import warnings
 from collections import deque
+from contextlib import contextmanager
 from itertools import islice
 from multiprocessing import cpu_count
 from typing import Tuple, Union
@@ -546,6 +547,23 @@ class BaseJoinSelector(BaseEstimator):
             this_segment[1] - this_segment[0]
         ).total_seconds()
 
+    @contextmanager
+    def timed(self, label: str):
+        """Context manager that times the execution of its body.
+
+        Equivalent to calling `_start_time` before and `_end_time` after the
+        wrapped block. Durations for the same label are cumulative.
+
+        Example:
+            >>> with self.timed("join_train"):
+            ...     merged = self._execute_joins(...)
+        """
+        self._start_time(label)
+        try:
+            yield
+        finally:
+            self._end_time(label)
+
     def clean_timers(self):
         self.timestamps = {}
         self.durations = {}
@@ -667,36 +685,32 @@ class NoJoin(BaseJoinSelector):
         if X.shape[0] != y.shape[0]:
             raise ValueError
 
-        self._start_time("prepare")
+        with self.timed("prepare"):
+            if validation_set is not None:
+                X_valid, y_valid = validation_set
+                X_train, y_train = X, y
+            else:
+                X_train, X_valid, y_train, y_valid = train_test_split(
+                    X, y, test_size=0.2
+                )
 
-        if validation_set is not None:
-            X_valid, y_valid = validation_set
-            X_train, y_train = X, y
-        else:
-            X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
+            self.build_model(X_train)
 
-        self.build_model(X_train)
+            self.n_joined_columns = len(X_train.columns)
 
-        self.n_joined_columns = len(X_train.columns)
-        self._end_time("prepare")
+        with self.timed("model_train"):
+            self.fit_model(X_train, y_train, validation_set=(X_valid, y_valid))
+            # else:
+            #     with self.timed("prepare"):
+            #         self.build_model(X)
+            #         self.n_joined_columns = len(X.columns)
 
-        self._start_time("model_train")
-        self.fit_model(X_train, y_train, validation_set=(X_valid, y_valid))
-        self._end_time("model_train")
-        # else:
-        #     self._start_time("prepare")
-        #     self.build_model(X)
-        #     self.n_joined_columns = len(X.columns)
-        #     self._end_time("prepare")
-
-        #     self._start_time("model_train")
-        #     self.fit_model(X, y)
-        #     self._end_time("model_train")
+            #     with self.timed("model_train"):
+            #         self.fit_model(X, y)
 
     def predict(self, X):
-        self._start_time("model_predict")
-        pred = self.predict_model(X)
-        self._end_time("model_predict")
+        with self.timed("model_predict"):
+            pred = self.predict_model(X)
         return pred
 
     def get_additional_info(self):
@@ -734,70 +748,61 @@ class HighestContainmentJoin(BaseJoinWithCandidatesMethod):
         self.left_on = self.right_on = None
 
     def fit(self, X, y):
-        self._start_time("prepare")
-        # Find the exact containment ranking
-        self.candidate_ranking = build_containment_ranking(X, self.candidate_joins)
-        # Select the top-1 candidate
-        self.best_cnd_hash = self.candidate_ranking.top_k(1, by="containment")[
-            "candidate"
-        ].item()
+        with self.timed("prepare"):
+            # Find the exact containment ranking
+            self.candidate_ranking = build_containment_ranking(X, self.candidate_joins)
+            # Select the top-1 candidate
+            self.best_cnd_hash = self.candidate_ranking.top_k(1, by="containment")[
+                "candidate"
+            ].item()
 
-        mdata = self.candidate_joins[self.best_cnd_hash]  # type: ignore
-        _, best_cnd_md, self.left_on, self.right_on = mdata.get_join_information()
+            mdata = self.candidate_joins[self.best_cnd_hash]  # type: ignore
+            _, best_cnd_md, self.left_on, self.right_on = mdata.get_join_information()
 
-        self.best_cnd_table = pl.read_parquet(best_cnd_md["full_path"])
+            self.best_cnd_table = pl.read_parquet(best_cnd_md["full_path"])
 
-        # Split in train and validation
-        X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
+            # Split in train and validation
+            X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
 
-        self._end_time("prepare")
-        self._start_time("join_train")
-        # Execute join separately on each split (to avoid contamination with aggr)
-        merged_train, merged_valid = self._execute_joins(
-            X_train=X_train,
-            X_valid=X_valid,
-            cnd_table=self.best_cnd_table,
-            left_on=self.left_on,
-            right_on=self.right_on,
-        )
-        self.n_joined_columns = len(merged_train.columns)
-        self._end_time("join_train")
-        self._start_time("model_train")
-        self.build_model(merged_train)
+        with self.timed("join_train"):
+            # Execute join separately on each split (to avoid contamination with aggr)
+            merged_train, merged_valid = self._execute_joins(
+                X_train=X_train,
+                X_valid=X_valid,
+                cnd_table=self.best_cnd_table,
+                left_on=self.left_on,
+                right_on=self.right_on,
+            )
+            self.n_joined_columns = len(merged_train.columns)
+            # else:
+            #     merged_train = self._execute_joins(
+            #         X_train=X,
+            #         cnd_table=self.best_cnd_table,
+            #         left_on=self.left_on,
+            #         right_on=self.right_on,
+            #     )
+            #     self.n_joined_columns = len(merged_train.columns)
 
-        # Fit the given model
-        self.fit_model(merged_train, y_train, validation_set=(merged_valid, y_valid))
-        self._end_time("model_train")
-        # else:
-        #     self._end_time("prepare")
-        #     self._start_time("join_train")
-        #     merged_train = self._execute_joins(
-        #         X_train=X,
-        #         cnd_table=self.best_cnd_table,
-        #         left_on=self.left_on,
-        #         right_on=self.right_on,
-        #     )
-        #     self.n_joined_columns = len(merged_train.columns)
-        #     self._end_time("join_train")
-        #     self._start_time("model_train")
-        #     self.build_model(merged_train)
-        #     self.fit_model(merged_train, y)
-        #     self._end_time("model_train")
+        with self.timed("model_train"):
+            self.build_model(merged_train)
+
+            # Fit the given model
+            self.fit_model(
+                merged_train, y_train, validation_set=(merged_valid, y_valid)
+            )
 
     def predict(self, X):
-        self._start_time("join_predict")
-        merged_test = ju.execute_join_with_aggregation(
-            X,
-            self.best_cnd_table,
-            left_on=self.left_on,
-            right_on=self.right_on,
-            aggregation=self.join_parameters["aggregation"],
-            suffix="_right",
-        )
-        self._end_time("join_predict")
-        self._start_time("model_predict")
-        pred = self.predict_model(merged_test)
-        self._end_time("model_predict")
+        with self.timed("join_predict"):
+            merged_test = ju.execute_join_with_aggregation(
+                X,
+                self.best_cnd_table,
+                left_on=self.left_on,
+                right_on=self.right_on,
+                aggregation=self.join_parameters["aggregation"],
+                suffix="_right",
+            )
+        with self.timed("model_predict"):
+            pred = self.predict_model(merged_test)
         return pred
 
     def get_estimator_parameters(self):
@@ -871,10 +876,9 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
         return self.candidate_ranking.limit(top_k)
 
     def fit(self, X, y):
-        self._start_time("prepare")
-        # Prepare splits
-        X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
-        self._end_time("prepare")
+        with self.timed("prepare"):
+            # Prepare splits
+            X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
         ranking = []
 
         for hash_, cjoin in tqdm(
@@ -895,6 +899,9 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
 
             self._end_time("join_train")
 
+            # NOTE: the `model_train` region ends in different places depending
+            # on the branch (inside `_fit_predict_inner_model` for `use_rf`),
+            # so explicit timer calls are kept here.
             self._start_time("model_train")
             # Build the model
             self.build_model(merged_train)
@@ -923,46 +930,43 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
             self._end_time("prepare")
 
         # RETRAINING THE MODEL
-        self._start_time("prepare")
-        best_join_mdata = self.candidate_joins[self.best_cnd_hash]
-        (
-            _,
-            best_cnd_md,
-            self.left_on,
-            self.right_on,
-        ) = best_join_mdata.get_join_information()
+        with self.timed("prepare"):
+            best_join_mdata = self.candidate_joins[self.best_cnd_hash]
+            (
+                _,
+                best_cnd_md,
+                self.left_on,
+                self.right_on,
+            ) = best_join_mdata.get_join_information()
 
-        self.best_cnd_table = pl.read_parquet(best_cnd_md["full_path"])
-        self._end_time("prepare")
-        self._start_time("join_train")
-        best_train, best_valid = self._execute_joins(
-            X_train, X_valid, self.best_cnd_table, self.left_on, self.right_on
-        )
-        self.n_joined_columns = len(best_train.columns)
-        self._end_time("join_train")
+            self.best_cnd_table = pl.read_parquet(best_cnd_md["full_path"])
+        with self.timed("join_train"):
+            best_train, best_valid = self._execute_joins(
+                X_train, X_valid, self.best_cnd_table, self.left_on, self.right_on
+            )
+            self.n_joined_columns = len(best_train.columns)
 
-        self._start_time("model_train")
-        self.build_model(best_train)
+        with self.timed("model_train"):
+            self.build_model(best_train)
 
-        self.fit_model(best_train, y_train, validation_set=(best_valid, y_valid))
-        self.candidate_ranking = pl.from_dicts(ranking).sort("metric", descending=True)
-        self._end_time("model_train")
+            self.fit_model(best_train, y_train, validation_set=(best_valid, y_valid))
+            self.candidate_ranking = pl.from_dicts(ranking).sort(
+                "metric", descending=True
+            )
 
     def predict(self, X):
-        self._start_time("join_predict")
-        merged_test = ju.execute_join_with_aggregation(
-            X,
-            self.best_cnd_table,
-            left_on=self.left_on,
-            right_on=self.right_on,
-            aggregation=self.join_parameters["aggregation"],
-            suffix="_right",
-        )
-        self._end_time("join_predict")
+        with self.timed("join_predict"):
+            merged_test = ju.execute_join_with_aggregation(
+                X,
+                self.best_cnd_table,
+                left_on=self.left_on,
+                right_on=self.right_on,
+                aggregation=self.join_parameters["aggregation"],
+                suffix="_right",
+            )
 
-        self._start_time("model_predict")
-        pred = self.predict_model(merged_test)
-        self._end_time("model_predict")
+        with self.timed("model_predict"):
+            pred = self.predict_model(merged_test)
 
         return pred
 
@@ -1046,50 +1050,38 @@ class FullJoin(BaseJoinWithCandidatesMethod):
             return None
 
     def fit(self, X=None, y=None):
-        self._start_time("prepare")
-        X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
-        merged_train = X_train.clone().lazy()
-        self._end_time("prepare")
-        self._start_time("join_train")
-        merged_train = ju.execute_join_all_candidates(
-            merged_train, self.candidate_joins, self.join_parameters["aggregation"]
-        )
-        merged_valid = X_valid.clone().lazy()
-        merged_valid = ju.execute_join_all_candidates(
-            merged_valid, self.candidate_joins, self.join_parameters["aggregation"]
-        )
-        self._end_time("join_train")
-        self._start_time("model_train")
-        self.build_model(merged_train)
-        self.fit_model(merged_train, y_train, validation_set=(merged_valid, y_valid))
-        self._end_time("model_train")
-
-        # else:
-        #     self._start_time("prepare")
-        #     merged_train = X.clone().lazy()
-        #     self._end_time("prepare")
-        #     self._start_time("join_train")
-        #     merged_train = ju.execute_join_all_candidates(
-        #         merged_train, self.candidate_joins, self.join_parameters["aggregation"]
-        #     )
-        #     self._end_time("join_train")
-        #     self._start_time("model_train")
-        #     self.build_model(merged_train)
-        #     self.fit_model(merged_train, y)
-        #     self._end_time("model_train")
+        with self.timed("prepare"):
+            X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
+            merged_train = X_train.clone().lazy()
+        with self.timed("join_train"):
+            merged_train = ju.execute_join_all_candidates(
+                merged_train, self.candidate_joins, self.join_parameters["aggregation"]
+            )
+            merged_valid = X_valid.clone().lazy()
+            merged_valid = ju.execute_join_all_candidates(
+                merged_valid, self.candidate_joins, self.join_parameters["aggregation"]
+            )
+            # else:
+            #     merged_train = X.clone().lazy()
+            #     merged_train = ju.execute_join_all_candidates(
+            #         merged_train, self.candidate_joins, self.join_parameters["aggregation"]
+            #     )
+        with self.timed("model_train"):
+            self.build_model(merged_train)
+            self.fit_model(
+                merged_train, y_train, validation_set=(merged_valid, y_valid)
+            )
         self.n_joined_columns = len(merged_train.columns)
 
     def predict(self, X: pd.DataFrame):
-        self._start_time("join_predict")
-        merged_test = X.clone().lazy()
-        merged_test = ju.execute_join_all_candidates(
-            merged_test, self.candidate_joins, self.join_parameters["aggregation"]
-        )
-        self._end_time("join_predict")
+        with self.timed("join_predict"):
+            merged_test = X.clone().lazy()
+            merged_test = ju.execute_join_all_candidates(
+                merged_test, self.candidate_joins, self.join_parameters["aggregation"]
+            )
 
-        self._start_time("model_predict")
-        pred = self.predict_model(merged_test)
-        self._end_time("model_predict")
+        with self.timed("model_predict"):
+            pred = self.predict_model(merged_test)
 
         return pred
 
@@ -1167,22 +1159,19 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
         self.wrap_up_joiner_params = model_parameters
 
     def fit(self, X: pd.DataFrame, y):
-        self._start_time("prepare")
-        X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
+        with self.timed("prepare"):
+            X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
 
-        self.candidate_ranking = self._build_ranking(X)
-        ########## BASE TABLE
-        self._start_time("model_train")
-        self.build_model(X_train)
+            self.candidate_ranking = self._build_ranking(X)
+            ########## BASE TABLE
+            with self.timed("model_train"):
+                self.build_model(X_train)
 
-        # Fit the given model
-        self.fit_model(X_train, y_train, validation_set=(X_valid, y_valid))
-        self._end_time("model_train")
-        self._start_time("model_predict")
-        y_pred = self.predict_model(X_valid)
-        self._end_time("model_predict")
-        metric = self._evaluate_candidate(y_valid, y_pred)
-        self._end_time("prepare")
+                # Fit the given model
+                self.fit_model(X_train, y_train, validation_set=(X_valid, y_valid))
+            with self.timed("model_predict"):
+                y_pred = self.predict_model(X_valid)
+            metric = self._evaluate_candidate(y_valid, y_pred)
         self.current_metric = metric
 
         self.current_X_train = X_train
@@ -1195,6 +1184,9 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
             leave=False,
             position=2,
         ):
+            # NOTE: when no candidates are left, the timer segment started
+            # here is abandoned (as in the original implementation), so
+            # explicit timer calls are kept for this block.
             self._start_time("prepare")
             cjoin = self._get_candidate()
             if cjoin is None:
@@ -1206,18 +1198,18 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
             cnd_hash = cnd_md["hash"]
             self._end_time("prepare")
             if cjoin_id not in self.already_joined_tables:
-                self._start_time("join_train")
-                temp_X_train, temp_X_valid = self._execute_joins(
-                    self.current_X_train,
-                    self.current_X_valid,
-                    cnd_table,
-                    left_on,
-                    right_on,
-                    suffix=cjoin.candidate_id[:10],
-                )
+                with self.timed("join_train"):
+                    temp_X_train, temp_X_valid = self._execute_joins(
+                        self.current_X_train,
+                        self.current_X_valid,
+                        cnd_table,
+                        left_on,
+                        right_on,
+                        suffix=cjoin.candidate_id[:10],
+                    )
 
-                self._end_time("join_train")
-
+                # NOTE: the `model_train` region ends in different places
+                # depending on the branch, so explicit timer calls are kept.
                 self._start_time("model_train")
                 self.build_model(temp_X_train)
 
@@ -1239,38 +1231,34 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
                 metric = self._evaluate_candidate(y_valid, y_pred)
                 self._end_time("prepare")
             else:
-                self._start_time("prepare")
-                metric = -np.inf
-                temp_X_train = temp_X_valid = None
-                self._end_time("prepare")
-            self._start_time("prepare")
-            self._update_ranking(cjoin, metric, temp_X_train, temp_X_valid)
-            self._end_time("prepare")
+                with self.timed("prepare"):
+                    metric = -np.inf
+                    temp_X_train = temp_X_valid = None
+            with self.timed("prepare"):
+                self._update_ranking(cjoin, metric, temp_X_train, temp_X_valid)
 
         if len(self.selected_candidates) > 0:
             # Full join all the selected candidates
-            self._start_time("prepare")
-            self.wrap_up_joiner = FullJoin(
-                scenario_logger=self.scenario_logger,
-                candidate_joins=self.selected_candidates,
-                target_column=self.target_column,
-                model_parameters=self.wrap_up_joiner_params,
-                join_parameters=self.join_parameters,
-                task=self.task,
-            )
-            self._end_time("prepare")
+            with self.timed("prepare"):
+                self.wrap_up_joiner = FullJoin(
+                    scenario_logger=self.scenario_logger,
+                    candidate_joins=self.selected_candidates,
+                    target_column=self.target_column,
+                    model_parameters=self.wrap_up_joiner_params,
+                    join_parameters=self.join_parameters,
+                    task=self.task,
+                )
             self.wrap_up_joiner.fit(X=X, y=y)
 
         else:
             # No good candidates found, train on the base table
-            self._start_time("prepare")
-            self.wrap_up_joiner = NoJoin(
-                scenario_logger=self.scenario_logger,
-                target_column=self.target_column,
-                model_parameters=self.wrap_up_joiner_params,
-                task=self.task,
-            )
-            self._end_time("prepare")
+            with self.timed("prepare"):
+                self.wrap_up_joiner = NoJoin(
+                    scenario_logger=self.scenario_logger,
+                    target_column=self.target_column,
+                    model_parameters=self.wrap_up_joiner_params,
+                    task=self.task,
+                )
             self.wrap_up_joiner.fit(X=X, y=y)
 
         self.n_joined_columns = self.wrap_up_joiner.n_joined_columns

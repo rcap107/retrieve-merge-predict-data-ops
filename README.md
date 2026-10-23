@@ -117,9 +117,24 @@ per fold on the training data (instead of separately on the inner train and
 validation splits), so the reported `time_join_train` is lower than with the
 legacy implementation while results are identical.
 
+A third option, `light` (boolean, default `false`, only with
+`engine = "data_ops"`), runs the whole evaluation with a single
+`skb.cross_validate` call per estimator: the folds are driven by skrub through
+the splitter configured on `mark_as_X`, and the results are reported in the
+same format as the other engines. No memory profiling is performed, no run
+log files are produced and the phase timings are not reported, making this
+mode suitable for debugging and quick iteration (see
+`config/evaluation/general/config-binary-dataops-light.toml` for an example).
+
 Note that, as in the original implementation, neither the outer
 GroupShuffleSplit nor the inner train/validation split is seeded; runs are
 reproducible at the procedure level rather than bit-for-bit.
+
+During the evaluation, the memory usage of the fit/predict steps is sampled
+with a background thread (`psutil`) rather than with a `memory_profiler`
+subprocess; this removes the cost of spawning a sampling process from the
+measured durations (significant on macOS, where the default `spawn` start
+method would re-import the whole program in the sampler).
 
 # Downloading YADL
 It is possible to download YADL from [the zenodo repository](https://zenodo.org/records/12607873) 

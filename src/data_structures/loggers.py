@@ -3,10 +3,15 @@ import csv
 import datetime as dt
 import json
 import logging
+import os
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from time import process_time
 
 import polars as pl
+import psutil
 from sklearn.metrics import f1_score, r2_score, roc_auc_score, root_mean_squared_error
 from tqdm import tqdm
 
@@ -19,6 +24,45 @@ logging.basicConfig(
     filename="data/logging.txt",
     level=logging.DEBUG,
 )
+
+
+def sampled_memory_usage(func, args, interval: float = 0.1) -> tuple[list, object]:
+    """Run `func(*args)` while sampling the memory usage of this process.
+
+    Drop-in replacement for
+    `memory_profiler.memory_usage((func, args), timestamps=True, retval=True)`
+    that samples the resident memory with a background thread instead of
+    spawning a child process. This avoids the cost of re-importing the main
+    module in the sampling subprocess (significant on platforms using the
+    `spawn` start method, such as macOS), which would otherwise be included
+    in the measured durations.
+
+    Args:
+        func: The function to execute.
+        args (tuple): Positional arguments passed to `func`.
+        interval (float): Sampling interval in seconds.
+
+    Returns:
+        tuple: A list of `(memory_MiB, timestamp)` tuples, and the value
+        returned by `func`.
+    """
+    process = psutil.Process(os.getpid())
+    samples: list = []
+    done = threading.Event()
+
+    def _sample():
+        while not done.is_set():
+            samples.append((process.memory_info().rss / 2**20, time.time()))
+            done.wait(interval)
+
+    sampler = threading.Thread(target=_sample, daemon=True)
+    sampler.start()
+    try:
+        returned = func(*args)
+    finally:
+        done.set()
+        sampler.join()
+    return samples, returned
 
 
 class ScenarioLogger:
@@ -339,6 +383,56 @@ class RunLogger:
         if label not in self.timestamps:
             raise KeyError(f"Label {label} was not found.")
         return self.mark_time(label, cumulative)
+
+    @contextmanager
+    def timed(self, label: str, cumulative: bool = False):
+        """Context manager that times the execution of its body.
+
+        Equivalent to calling `start_time` before and `end_time` after the
+        wrapped block.
+
+        Args:
+            label (str): Label of the operation to mark.
+            cumulative (bool, optional): If set to true, all operations performed with the same label
+            will add up to a total duration rather than being marked independently. Defaults to False.
+
+        Example:
+            >>> with run_logger.timed("fit"):
+            ...     estimator.fit(X, y)
+        """
+        self.start_time(label, cumulative)
+        try:
+            yield self
+        finally:
+            self.end_time(label, cumulative)
+
+    def profiled_call(self, mem_label: str, func, *args, time_label=None, retval=False):
+        """Run a function with memory profiling, recording duration and memory.
+
+        This fuses the usual `start_time` / `memory_usage` / `end_time` /
+        `mark_memory` sequence used around the fit, predict and scoring steps
+        of the evaluation loop.
+
+        Args:
+            mem_label (str): Label used to record the memory usage.
+            func: The function to execute.
+            *args: Positional arguments passed to `func`.
+            time_label (str, optional): Label used for the duration. If None,
+                no duration is recorded (matching blocks that only measure
+                memory). Defaults to None.
+            retval (bool, optional): Whether to return the output of `func`.
+                Defaults to False.
+
+        Returns:
+            The output of `func` if `retval` is True, else None.
+        """
+        if time_label is not None:
+            self.start_time(time_label)
+        mem_usage, out = sampled_memory_usage(func, args)
+        if time_label is not None:
+            self.end_time(time_label)
+        self.mark_memory(mem_usage, mem_label)
+        return out
 
     def mark_time(self, label: str, cumulative: bool = False):
         """Given a `label`, add a new timestamp if `label` isn't found, otherwise

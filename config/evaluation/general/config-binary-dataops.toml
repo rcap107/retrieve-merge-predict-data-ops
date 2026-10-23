@@ -10,6 +10,10 @@ engine = ["data_ops"]
 # When true, the full_join estimator performs its joins in a node of the
 # DataOps plan rather than inside the estimator's fit.
 plan_native_join = [false]
+# Light mode: run the evaluation with a single skb.cross_validate call per
+# estimator (no memory profiling, no run logs, no phase timings). Intended
+# for debugging and fast iteration.
+light = [false]
 
 
 ["join_parameters"]

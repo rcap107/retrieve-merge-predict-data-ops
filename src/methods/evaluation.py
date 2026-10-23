@@ -6,7 +6,6 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from memory_profiler import memory_usage
 from sklearn.model_selection import GroupShuffleSplit, ShuffleSplit
 from tqdm import tqdm
 
@@ -157,6 +156,20 @@ def evaluate_joins(
     """
     if run_parameters.get("engine", "legacy") == "data_ops":
         # Imported here to avoid a circular import
+        if run_parameters.get("light", False):
+            from src.methods.data_ops_plan import evaluate_joins_light
+
+            return evaluate_joins_light(
+                scenario_logger=scenario_logger,
+                base_table=base_table,
+                join_candidates=join_candidates,
+                target_column=target_column,
+                group_column=group_column,
+                estim_parameters=estim_parameters,
+                join_parameters=join_parameters,
+                model_parameters=model_parameters,
+                run_parameters=run_parameters,
+            )
         from src.methods.data_ops_plan import evaluate_joins_data_ops
 
         return evaluate_joins_data_ops(
@@ -231,49 +244,19 @@ def evaluate_joins(
 
             estim.clean_timers()
             # Execute the fit operation
-            run_logger.start_time("fit")
-            mem_usage = memory_usage(
-                (
-                    estim.fit,
-                    (
-                        X_train,
-                        y_train,
-                    ),
-                ),
-                timestamps=True,
-                max_iterations=1,
+            run_logger.profiled_call(
+                "fit", estim.fit, X_train, y_train, time_label="fit"
             )
-            run_logger.end_time("fit")
-            run_logger.mark_memory(mem_usage, "fit")
 
             # Execute the predict operation
-            run_logger.start_time("predict")
-            mem_usage, y_pred = memory_usage(
-                (
-                    estim.predict,
-                    (X_test,),
-                ),
-                timestamps=True,
-                max_iterations=1,
-                retval=True,
+            y_pred = run_logger.profiled_call(
+                "predict", estim.predict, X_test, time_label="predict", retval=True
             )
-            run_logger.end_time("predict")
-            run_logger.mark_memory(mem_usage, "predict")
 
             # Evaluate the results
-            mem_usage, results = memory_usage(
-                (
-                    run_logger.measure_results,
-                    (
-                        y_test,
-                        y_pred,
-                    ),
-                ),
-                timestamps=True,
-                max_iterations=1,
-                retval=True,
+            results = run_logger.profiled_call(
+                "test", run_logger.measure_results, y_test, y_pred, retval=True
             )
-            run_logger.mark_memory(mem_usage, "test")
             curr_res = {"estimator": estim.name, **results}
 
             # Additional info includes best candidate join and relative info

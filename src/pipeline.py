@@ -185,6 +185,8 @@ def validate_configuration(run_config: dict):
 
     assert run_parameters.get("plan_native_join", False) in [True, False]
 
+    assert run_parameters.get("light", False) in [True, False]
+
     assert run_parameters["debug"] in [True, False]
 
     assert (

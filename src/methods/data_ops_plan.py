@@ -19,7 +19,6 @@ import time
 import numpy as np
 import polars as pl
 import skrub
-from memory_profiler import memory_usage
 from sklearn.model_selection import GroupShuffleSplit, ShuffleSplit, train_test_split
 from tqdm import tqdm
 
@@ -388,45 +387,28 @@ def evaluate_joins_data_ops(
 
                 # Execute the fit operation
                 _join_timings.clear()
-                run_logger.start_time("fit")
-                mem_usage = memory_usage(
-                    (learner.fit, (split_data["train"],)),
-                    timestamps=True,
-                    max_iterations=1,
+                run_logger.profiled_call(
+                    "fit", learner.fit, split_data["train"], time_label="fit"
                 )
-                run_logger.end_time("fit")
-                run_logger.mark_memory(mem_usage, "fit")
                 join_train_time = _last_join_time()
 
                 y_test = split_data["y_test"]
 
                 # Execute the predict operation
                 _join_timings.clear()
-                run_logger.start_time("predict")
-                mem_usage, y_pred = memory_usage(
-                    (learner.predict, (split_data["test"],)),
-                    timestamps=True,
-                    max_iterations=1,
+                y_pred = run_logger.profiled_call(
+                    "predict",
+                    learner.predict,
+                    split_data["test"],
+                    time_label="predict",
                     retval=True,
                 )
-                run_logger.end_time("predict")
-                run_logger.mark_memory(mem_usage, "predict")
                 join_predict_time = _last_join_time()
 
                 # Evaluate the results
-                mem_usage, results = memory_usage(
-                    (
-                        run_logger.measure_results,
-                        (
-                            y_test,
-                            y_pred,
-                        ),
-                    ),
-                    timestamps=True,
-                    max_iterations=1,
-                    retval=True,
+                results = run_logger.profiled_call(
+                    "test", run_logger.measure_results, y_test, y_pred, retval=True
                 )
-                run_logger.mark_memory(mem_usage, "test")
                 curr_res = {"estimator": estimator.name, **results}
 
                 # Additional info includes best candidate join and relative info
@@ -453,4 +435,110 @@ def evaluate_joins_data_ops(
 
     scenario_logger.additional_info = add_info_dict
     scenario_logger.results = pl.from_dicts(res_list)
+    scenario_logger.print_results()
+
+
+REGRESSION_SCORING = {"r2": "r2", "rmse": "neg_root_mean_squared_error"}
+CLASSIFICATION_SCORING = {"f1": "f1", "auc": "roc_auc"}
+
+
+def _cv_results_frame(cv_results, estimator_name: str, task: str) -> pl.DataFrame:
+    """Convert the pandas DataFrame returned by `skb.cross_validate` into the
+    results frame used by the ScenarioLogger (one row per fold)."""
+    if task == "regression":
+        return pl.DataFrame(
+            {
+                "estimator": [estimator_name] * len(cv_results),
+                "r2": cv_results["test_r2"].to_numpy(),
+                "rmse": -cv_results["test_rmse"].to_numpy(),
+            }
+        )
+    if task == "classification":
+        return pl.DataFrame(
+            {
+                "estimator": [estimator_name] * len(cv_results),
+                "f1": cv_results["test_f1"].to_numpy(),
+                "auc": cv_results["test_auc"].to_numpy(),
+            }
+        )
+    raise ValueError(f"Task {task} not supported.")
+
+
+def evaluate_joins_light(
+    scenario_logger,
+    base_table: pl.DataFrame,
+    join_candidates,
+    target_column: str = "target",
+    group_column: str = "col_to_embed",
+    estim_parameters: dict | None = None,
+    join_parameters: dict | None = None,
+    model_parameters: dict | None = None,
+    run_parameters: dict | None = None,
+):
+    """Lightweight evaluation of the join estimators using skrub DataOps.
+
+    Intended for debugging and fast iteration: one plan is built per active
+    estimator and cross-validated with a single call to `skb.cross_validate`.
+    The splitter in `mark_as_X` drives the folds, so no manual loop is needed.
+
+    Differently from `evaluate_joins_data_ops`, no memory profiling is
+    performed, no run log files are produced and the phase timings
+    (`time_join_train`, etc.) are not reported. The results are stored in the
+    scenario logger so that the standard analysis tools can be used.
+
+    Args:
+        scenario_logger (ScenarioLogger): ScenarioLogger object used to track the results of the runs.
+        base_table (pl.DataFrame): Base table to evaluate.
+        join_candidates: List of candidate joins that will be used for the estimators.
+        target_column (str): Target column that is used for training the model. Defaults to "target".
+        group_column (str): Column that will be used for joining. Defaults to "col_to_embed".
+        estim_parameters (dict | None): Additional parameters for the estimator. Defaults to None.
+        join_parameters (dict | None): Additional parameters to be used in the join operation. Defaults to None.
+        model_parameters (dict | None): Additional parameters to be passed to the ML model. Defaults to None.
+        run_parameters (dict | None): Additional parameters relative to the run. Defaults to None.
+    """
+    task = run_parameters["task"]
+    scoring = REGRESSION_SCORING if task == "regression" else CLASSIFICATION_SCORING
+
+    estim_common_parameters = {
+        "scenario_logger": None,
+        "target_column": target_column,
+        "model_parameters": model_parameters,
+        "task": task,
+    }
+
+    estimator_names = [
+        estim for estim in estim_parameters if estim_parameters[estim]["active"]
+    ]
+    if len(estimator_names) == 0:
+        raise ValueError("No active estimators were found.")
+
+    res_frames = []
+    for estim_name in estimator_names:
+        params = dict(estim_common_parameters)
+        params.update(estim_parameters.get(estim_name, {}))
+
+        estimator = prepare_estimator(
+            estim_name,
+            params,
+            join_candidates,
+            join_parameters,
+        )
+        if estimator is None:
+            continue
+
+        # One plan per estimator; the folds are driven by the splitter
+        # configured on `mark_as_X`.
+        pred, env = build_plan(
+            run_parameters=run_parameters,
+            model_parameters=model_parameters,
+            group_column=group_column,
+            base_table=base_table,
+            estimator=estimator,
+            splits=None,
+        )
+        cv_results = pred.skb.cross_validate(environment=env, scoring=scoring)
+        res_frames.append(_cv_results_frame(cv_results, estimator.name, task))
+
+    scenario_logger.results = pl.concat(res_frames, how="vertical")
     scenario_logger.print_results()

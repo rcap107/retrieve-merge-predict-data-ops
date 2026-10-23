@@ -235,6 +235,41 @@ def compare_results(
     return mismatches
 
 
+def compare_duration_keys(
+    reference_logs: list[dict], other_logs: list[dict], ref_name: str, other_name: str
+):
+    """Compare the set of non-empty `time_*` duration keys between the run
+    logs of the two engines. Values are noisy (wall-clock times), so only the
+    structure is asserted."""
+
+    def duration_keys(log: dict) -> set:
+        return {
+            k for k, v in log.items() if k.startswith("time_") and v not in ("", None)
+        }
+
+    mismatches = []
+    for ref_log, other_log in zip(reference_logs, other_logs):
+        ref_key = f"{ref_log['estimator']} fold {ref_log.get('fold_id', '')}"
+        other_key = f"{other_log['estimator']} fold {other_log.get('fold_id', '')}"
+        ref_keys, other_keys = duration_keys(ref_log), duration_keys(other_log)
+        if ref_keys != other_keys:
+            mismatches.append(
+                f"{ref_key} ({ref_name}) {sorted(ref_keys)} != "
+                f"{other_key} ({other_name}) {sorted(other_keys)}"
+            )
+    return mismatches
+
+
+def load_run_logs(exp_name: str) -> list[dict]:
+    import json
+
+    log_dir = Path("results/logs", exp_name, "run_logs")
+    logs = []
+    for path in sorted(log_dir.glob("*.log")):
+        logs.append(json.loads(path.read_text()))
+    return logs
+
+
 def main():
     args = parse_args()
     _freeze_randomness()
@@ -283,10 +318,22 @@ def main():
         legacy_full, native_full, "legacy", "data_ops(plan-native)", strict=True
     )
 
+    print("\n== duration keys (legacy vs data_ops) ==")
+    all_mismatches += compare_duration_keys(
+        load_run_logs("parity_legacy"),
+        load_run_logs("parity_dops"),
+        "legacy",
+        "data_ops",
+    )
+
     if all_mismatches:
         print("\nPARITY CHECK FAILED:")
-        for row_id, estimator, metric, ref_v, other_v in all_mismatches:
-            print(f"  row {row_id} ({estimator}) {metric}: {ref_v} vs {other_v}")
+        for item in all_mismatches:
+            if isinstance(item, str):
+                print(f"  {item}")
+            else:
+                row_id, estimator, metric, ref_v, other_v = item
+                print(f"  row {row_id} ({estimator}) {metric}: {ref_v} vs {other_v}")
         sys.exit(1)
     print("\nPARITY CHECK PASSED")
 
