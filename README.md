@@ -97,7 +97,7 @@ versions used for the original experiments (python 3.10); they are kept for
 reference but they are not compatible with recent python versions.
 
 # Reproducibility: legacy vs DataOps engine
-The evaluation step can run with two interchangeable engines, selected with
+The evaluation step can run with three interchangeable engines, selected with
 the `engine` key in the `[run_parameters]` section of the evaluation configs:
 - `engine = "legacy"` (default): the original implementation, with a manual
   cross-validation loop.
@@ -105,10 +105,25 @@ the `engine` key in the `[run_parameters]` section of the evaluation configs:
   [skrub DataOps](https://skrub-data.org/) plan; data preparation, splitting
   and model training are handled by a `skrub.SkrubLearner`, while joins and
   aggregations reuse the same code as the legacy engine.
+- `engine = "data_ops_native"`: a deeper DataOps integration. The join of all
+  candidates for `full_join` is a node of the plan, and `best_single_join`
+  selects its candidate per fold with a `skrub.choose_from` choice scored by
+  a grid search over an inner validation split (mirroring the selection
+  principle of the legacy estimator, with an optional seed through
+  `inner_cv_seed`; the winner is refit on the whole training fold, so its
+  results may differ slightly from the legacy implementation).
+  `highest_containment` and `stepwise_greedy_join` reuse the legacy selector
+  classes applied to the plan.
 
-The two engines produce identical results (see `scripts/parity_check.py`,
-which compares them on identical data and splits). The log format is the same,
-so all analysis scripts work with either engine.
+The engines produce the same run logs and are verified equivalent by
+`scripts/parity_check.py` (exact equality of the metrics and of the logged
+duration keys; the native `best_single_join` is compared as a report, since
+its selection procedure differs slightly from the legacy one). The harness
+also runs the DataOps engines with the disk cache enabled to verify that
+caching does not alter the results. It requires no data: it generates a
+synthetic data lake and base table, and with `--save-artifacts` it writes
+the plan graphs and fitted learners of every engine under
+`results/parity_artifacts/`.
 
 An additional option, `plan_native_join` (boolean, default `false`), moves the
 join of all candidate tables for the `full_join` selector into a node of the
@@ -126,9 +141,67 @@ log files are produced and the phase timings are not reported, making this
 mode suitable for debugging and quick iteration (see
 `config/evaluation/general/config-binary-dataops-light.toml` for an example).
 
+**Caching**: setting `cache_dir = "path/to/cache"` in `[run_parameters]`
+enables the skrub disk cache. In the DataOps engines, the aggregation of the
+candidate tables (`first` and `mean` aggregations only) is then performed by
+a fold-independent plan node whose result is cached on disk and reused
+across folds and runs with the same candidates, which can substantially
+reduce the join times on repeated experiments. Cached results make the
+reported `time_join_train`/`time_join_predict` unrepresentative, so the
+cache should stay disabled when measuring execution times. Cache
+invalidation is best-effort (joblib); delete the cache directory after
+modifying the join code. The correctness of cached runs is verified by
+`scripts/parity_check.py`.
+
+**Run artifacts**: setting `save_artifacts = true` in `[run_parameters]`
+(with the DataOps engines) writes the computation graph of every estimator
+under `results/logs/<experiment>/graphs/<estimator>.svg` (the plan structure
+does not change across folds; for the native `best_single_join` the graph of
+the winning candidate branch is saved per fold, as
+`<estimator>_fold<k>.svg`), and the fitted learner of the last fold under
+`results/logs/<experiment>/learners/<estimator>.joblib`. The saved learner is
+self-contained and can be re-applied to new data:
+
+```python
+import joblib
+learner = joblib.load("results/logs/<exp>/learners/full_join.joblib")
+predictions = learner.predict({"base_table": new_table})
+```
+
+The learners are also available programmatically during the run through
+`scenario_logger.learners`. Note that in the plan graphs the estimators that
+join inside `fit` (`highest_containment`, `stepwise_greedy_join`) appear as a
+single node, since their internals are not part of the DataOps plan.
+
+# Hyperparameter search over the whole pipeline
+
+`search.py` builds a *single* skrub DataOps plan whose hyperparameters span
+the retrieval method (a choice over the offline query results), the join
+selection strategy, the aggregation, `top_k` and the predictor, and runs a
+randomized search (Optuna backend) over it:
+
+```
+python search.py config/evaluation/general/search-binary.toml
+```
+
+The query results of every retrieval method must exist before running the
+search (see the retrieval steps above). Every trial of the search corresponds
+to one configuration of the paper's grid, evaluated on the same seeded CV
+folds; the artifacts are `search_results.csv` (parameters and mean score per
+trial — the benchmark table), and the fitted learner and named parameters of
+the best configuration. Differences with respect to the paper's evaluation
+(see `src.methods.data_ops_search` for details): the folds are seeded,
+`best_single_join`'s candidate selection is flattened into the search space
+(selected on the outer folds instead of an inner train/validation split),
+`top_k` is tuned only for the `full_join` branch, and no memory/timing
+instrumentation is collected.
+
 Note that, as in the original implementation, neither the outer
 GroupShuffleSplit nor the inner train/validation split is seeded; runs are
-reproducible at the procedure level rather than bit-for-bit.
+reproducible at the procedure level rather than bit-for-bit (the native
+engine exposes `inner_cv_seed` to pin the inner split used by the candidate
+search). See `ROADMAP.md` for the planned extensions and `MIGRATION.md` for
+a detailed account of the migration and the decisions behind it.
 
 During the evaluation, the memory usage of the fit/predict steps is sampled
 with a background thread (`psutil`) rather than with a `memory_profiler`

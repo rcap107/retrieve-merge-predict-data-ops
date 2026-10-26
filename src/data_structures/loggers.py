@@ -116,6 +116,10 @@ class ScenarioLogger:
         self.exception_name = None
         self.additional_info = None
         self.debug = debug
+        # Fitted skrub learners saved when `save_artifacts` is enabled
+        # (mapping estimator name -> SkrubLearner of the last fold). Excluded
+        # from the JSON dumps (see `write_to_json`).
+        self.learners = {}
 
     def prepare_logger(self, run_name=None):
         self.path_run_logs = f"results/logs/{run_name}/run_logs/{self.scenario_id}.log"
@@ -220,6 +224,9 @@ class ScenarioLogger:
             print("ScenarioLogger is in debug mode, no logs will be written.")
             return None
         res_dict = copy.deepcopy(vars(self))
+        # Fitted learners are exposed programmatically (ScenarioLogger.learners)
+        # but are not JSON-serializable.
+        res_dict.pop("learners", None)
         if self.results is not None:
             results = self.results.clone()
             res_dict["results"] = results.to_dicts()

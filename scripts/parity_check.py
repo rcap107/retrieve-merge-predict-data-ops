@@ -46,14 +46,19 @@ def _freeze_randomness():
     differ. To compare the two engines strictly, the harness seeds the inner
     split and the global RNG. This does not modify the repository code.
     """
+    import csv
     import random
 
+    import src.data_structures.loggers as dlg
     import src.methods.data_ops_plan as dp
     import src.methods.join_selectors as js
+    import src.methods.model_core as mc
 
     random.seed(0)
 
     def _patch(module):
+        if not hasattr(module, "train_test_split"):
+            return
         original_split = module.train_test_split
 
         def seeded_split(*args, **kwargs):
@@ -64,6 +69,21 @@ def _freeze_randomness():
 
     _patch(js)
     _patch(dp)
+    _patch(mc)
+
+    # RunLogger only prints its JSON when `debug` is set; the harness needs
+    # the run logs on disk to compare the duration keys between engines.
+    def always_write_logfile(self, path_logfile):
+        path = Path(path_logfile)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        exists = path.exists()
+        with open(path, "a" if exists else "w") as fp:
+            writer = csv.DictWriter(fp, fieldnames=dlg.HEADER_RUN_LOGFILE)
+            if not exists:
+                writer.writeheader()
+            writer.writerow(self.to_dict())
+
+    dlg.RunLogger.to_logfile = always_write_logfile
 
 
 def parse_args():
@@ -77,6 +97,18 @@ def parse_args():
         action="store_true",
         help="Also run selectors whose selection depends on an unseeded "
         "inner split (results reported, not asserted).",
+    )
+    parser.add_argument(
+        "--save-artifacts",
+        action="store_true",
+        help="Enable `save_artifacts` for every engine and copy the produced "
+        "graphs and fitted learners to results/parity_artifacts/.",
+    )
+    parser.add_argument(
+        "--hpo-smoke",
+        action="store_true",
+        help="Run the hyperparameter search plan (data_ops_search) on the "
+        "synthetic data instead of the engine comparisons.",
     )
     return parser.parse_args()
 
@@ -139,7 +171,7 @@ def fabricate_data(n_samples: int, n_candidates: int, tmp_dir: Path):
     return base, candidates
 
 
-def make_run_config(args, engine: str, plan_native: bool, splits: list):
+def make_run_config(args, engine: str, plan_native: bool, splits: list, extra=None):
     estimators = {
         "no_join": {"active": True},
         "highest_containment": {"active": True},
@@ -154,17 +186,22 @@ def make_run_config(args, engine: str, plan_native: bool, splits: list):
             "epsilon": 0.0,
             "ranking_metric": "containment",
         }
+    run_parameters = {
+        "task": "regression",
+        "debug": True,
+        "n_splits": args.n_splits,
+        "test_size": 0.2,
+        "split_kind": "group_shuffle",
+        "engine": engine,
+        "plan_native_join": plan_native,
+        "_splits": splits,
+    }
+    if getattr(args, "save_artifacts", False):
+        run_parameters["save_artifacts"] = True
+    if extra:
+        run_parameters.update(extra)
     return {
-        "run_parameters": {
-            "task": "regression",
-            "debug": True,
-            "n_splits": args.n_splits,
-            "test_size": 0.2,
-            "split_kind": "group_shuffle",
-            "engine": engine,
-            "plan_native_join": plan_native,
-            "_splits": splits,
-        },
+        "run_parameters": run_parameters,
         "join_parameters": {"join_strategy": "left", "aggregation": "first"},
         "evaluation_models": {"chosen_model": args.model},
         "estimators": estimators,
@@ -261,22 +298,110 @@ def compare_duration_keys(
 
 
 def load_run_logs(exp_name: str) -> list[dict]:
-    import json
+    import csv
 
     log_dir = Path("results/logs", exp_name, "run_logs")
     logs = []
     for path in sorted(log_dir.glob("*.log")):
-        logs.append(json.loads(path.read_text()))
+        with open(path) as fp:
+            logs.extend(csv.DictReader(fp))
     return logs
+
+
+def run_hpo_smoke(args, base_table, candidates):
+    """Smoke test for the unified search plan (data_ops_search).
+
+    Builds one plan spanning two synthetic retrieval methods, four estimators
+    and two predictors, then runs a small randomized search over it.
+    """
+    import skrub
+
+    from src.methods.data_ops_search import run_search
+
+    # Two "retrieval methods" with the same candidates in different order.
+    query_results = {
+        "exact_matching": candidates,
+        "minhash": dict(reversed(list(candidates.items()))),
+    }
+    config = {
+        "run_parameters": {
+            "task": "regression",
+            "debug": True,
+            "n_splits": 2,
+            "test_size": 0.2,
+            "split_kind": "group_shuffle",
+        },
+        "join_parameters": {"join_strategy": "left", "aggregation": "first"},
+        "evaluation_models": {
+            "chosen_model": ["ridgecv", "catboost"],
+            "catboost": {
+                "iterations": 10,
+                "od_type": "Iter",
+                "od_wait": 5,
+                "l2_leaf_reg": 0.01,
+                "thread_count": 2,
+            },
+        },
+        "estimators": {
+            "no_join": {"active": True},
+            "full_join": {"active": True},
+            "best_single_join": {"active": True},
+            "highest_containment": {"active": True},
+        },
+        "query_cases": {"query_column": "col_to_embed"},
+        "search": {
+            "n_iter": 8,
+            "backend": "sklearn",
+            "seed": 0,
+            "aggregation_choices": ["first"],
+        },
+    }
+    search = run_search(config, base_table, query_results)
+    results = search.results_
+    print("\n== hpo smoke: search results ==")
+    print(results.to_string())
+    assert len(results) >= 8, f"expected at least 8 trials, got {len(results)}"
+    assert "config" in results.columns, results.columns.tolist()
+    predictions = search.best_learner_.predict({"base_table": base_table})
+    assert len(predictions) == len(base_table)
+
+    # Save the plan (unfitted DataOp) and its graph for inspection; the
+    # reloaded plan can be evaluated directly with new data.
+    import joblib
+
+    plans_dir = Path("results/hpo_smoke")
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    plan = search.data_op
+    joblib.dump(plan, plans_dir / "plan.joblib")
+    (plans_dir / "plan_graph.svg").write_bytes(plan.skb.draw_graph().svg)
+    reloaded = joblib.load(plans_dir / "plan.joblib")
+    reloaded_predictions = reloaded.skb.eval({"base_table": base_table})
+    assert len(reloaded_predictions) == len(base_table)
+    print(
+        f"Plan saved to {plans_dir / 'plan.joblib'} "
+        f"(graph: {plans_dir / 'plan_graph.svg'}); "
+        f"reloaded plan produced {len(reloaded_predictions)} predictions."
+    )
+    print("HPO SMOKE PASSED")
 
 
 def main():
     args = parse_args()
     _freeze_randomness()
+    # Clean the run logs of previous harness invocations (they are appended
+    # to by the patched RunLogger).
+    import shutil
     import tempfile
+
+    for stale in Path("results/logs").glob("parity_*"):
+        shutil.rmtree(stale)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="parity_check_"))
     base_table, candidates = fabricate_data(args.n_samples, args.n_candidates, tmp_dir)
+
+    if args.hpo_smoke:
+        run_hpo_smoke(args, base_table, candidates)
+        return
 
     # Explicit splits shared by both engines. Computed the same way the legacy
     # engine does it (unseeded GroupShuffleSplit on the query column), but
@@ -297,12 +422,74 @@ def main():
     )
 
     print("Running data_ops engine with plan-native joins...")
-    native_results = run_engine(
-        "dops_native",
+    native_plan_results = run_engine(
+        "dops_native_plan",
         make_run_config(args, "data_ops", True, splits),
         base_table,
         candidates,
     )
+
+    print("Running data_ops_native engine...")
+    native_results = run_engine(
+        "dopsn",
+        make_run_config(
+            args, "data_ops_native", False, splits, extra={"inner_cv_seed": 0}
+        ),
+        base_table,
+        candidates,
+    )
+
+    print("Running data_ops_native engine with skrub disk cache...")
+    cached_results = run_engine(
+        "dopsn_cache",
+        make_run_config(
+            args,
+            "data_ops_native",
+            False,
+            splits,
+            extra={
+                "cache_dir": str(tmp_dir / "skrub_cache"),
+                "inner_cv_seed": 0,
+            },
+        ),
+        base_table,
+        candidates,
+    )
+
+    if args.save_artifacts:
+        import shutil
+
+        dest_root = Path("results/parity_artifacts")
+        for engine_name in [
+            "legacy",
+            "dops",
+            "dops_native_plan",
+            "dopsn",
+            "dopsn_cache",
+        ]:
+            src = Path("results/logs", f"parity_{engine_name}")
+            for subdir in ["graphs", "learners"]:
+                if (src / subdir).exists():
+                    shutil.copytree(
+                        src / subdir,
+                        dest_root / engine_name / subdir,
+                        dirs_exist_ok=True,
+                    )
+        print(
+            f"\nRun artifacts copied to {dest_root} "
+            "(the legacy engine has no DataOps learners, so it produces none)"
+        )
+        try:
+            import joblib
+
+            learner = joblib.load(dest_root / "dops" / "learners" / "nojoin.joblib")
+            predictions = learner.predict({"base_table": base_table})
+            print(
+                f"Replay check: the saved nojoin learner produced "
+                f"{len(predictions)} predictions on the base table."
+            )
+        except Exception as exception:
+            print(f"Replay check failed: {exception}")
 
     all_mismatches = []
 
@@ -313,17 +500,62 @@ def main():
 
     print("\n== legacy full_join vs data_ops plan-native full_join (strict) ==")
     legacy_full = legacy_results.filter(pl.col("estimator").str.contains("full_join"))
-    native_full = native_results.filter(pl.col("estimator").str.contains("full_join"))
+    native_plan_full = native_plan_results.filter(
+        pl.col("estimator").str.contains("full_join")
+    )
     all_mismatches += compare_results(
-        legacy_full, native_full, "legacy", "data_ops(plan-native)", strict=True
+        legacy_full, native_plan_full, "legacy", "data_ops(plan-native)", strict=True
     )
 
-    print("\n== duration keys (legacy vs data_ops) ==")
+    print("\n== legacy vs data_ops_native (strict, except best_single_join) ==")
+    native_strict = native_results.filter(
+        ~pl.col("estimator").str.contains("best_single_join")
+    )
+    legacy_strict = legacy_results.filter(
+        pl.col("estimator").is_in(native_strict["estimator"].unique().to_list())
+    )
+    all_mismatches += compare_results(
+        legacy_strict, native_strict, "legacy", "data_ops_native", strict=True
+    )
+
+    print("\n== legacy vs data_ops_native best_single_join (report only) ==")
+    legacy_bsj = legacy_results.filter(
+        pl.col("estimator").str.contains("best_single_join")
+    )
+    native_bsj = native_results.filter(
+        pl.col("estimator").str.contains("best_single_join")
+    )
+    compare_results(legacy_bsj, native_bsj, "legacy", "data_ops_native", strict=False)
+
+    print("\n== data_ops_native with and without skrub cache (strict) ==")
+    # best_single_join is excluded: with an unseeded inner split its selection
+    # is not run-to-run reproducible in either engine.
+    native_cached_strict = native_results.filter(
+        ~pl.col("estimator").str.contains("best_single_join")
+    )
+    cached_strict = cached_results.filter(
+        ~pl.col("estimator").str.contains("best_single_join")
+    )
+    all_mismatches += compare_results(
+        native_cached_strict,
+        cached_strict,
+        "data_ops_native",
+        "data_ops_native(cache)",
+        strict=True,
+    )
+
+    print("\n== duration keys (legacy vs data_ops / data_ops_native) ==")
     all_mismatches += compare_duration_keys(
         load_run_logs("parity_legacy"),
         load_run_logs("parity_dops"),
         "legacy",
         "data_ops",
+    )
+    all_mismatches += compare_duration_keys(
+        load_run_logs("parity_legacy"),
+        load_run_logs("parity_dopsn"),
+        "legacy",
+        "data_ops_native",
     )
 
     if all_mismatches:

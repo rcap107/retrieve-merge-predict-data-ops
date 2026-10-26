@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import skrub
 from sklearn.model_selection import GroupShuffleSplit, ShuffleSplit
 from tqdm import tqdm
 
@@ -154,9 +155,26 @@ def evaluate_joins(
     Raises:
         ValueError: Raise ValueError if the number of provided estimators is 0.
     """
-    if run_parameters.get("engine", "legacy") == "data_ops":
-        # Imported here to avoid a circular import
-        if run_parameters.get("light", False):
+    engine = run_parameters.get("engine", "legacy")
+    if engine == "legacy":
+        return _evaluate_joins_legacy(
+            scenario_logger=scenario_logger,
+            base_table=base_table,
+            join_candidates=join_candidates,
+            target_column=target_column,
+            group_column=group_column,
+            estim_parameters=estim_parameters,
+            join_parameters=join_parameters,
+            model_parameters=model_parameters,
+            run_parameters=run_parameters,
+        )
+
+    # DataOps engines (imported here to avoid a circular import)
+    cache_dir = run_parameters.get("cache_dir")
+    if cache_dir is not None:
+        skrub.set_config(cache=cache_dir)
+    try:
+        if engine == "data_ops" and run_parameters.get("light", False):
             from src.methods.data_ops_plan import evaluate_joins_light
 
             return evaluate_joins_light(
@@ -170,9 +188,23 @@ def evaluate_joins(
                 model_parameters=model_parameters,
                 run_parameters=run_parameters,
             )
-        from src.methods.data_ops_plan import evaluate_joins_data_ops
+        if engine == "data_ops":
+            from src.methods.data_ops_plan import evaluate_joins_data_ops
 
-        return evaluate_joins_data_ops(
+            return evaluate_joins_data_ops(
+                scenario_logger=scenario_logger,
+                base_table=base_table,
+                join_candidates=join_candidates,
+                target_column=target_column,
+                group_column=group_column,
+                estim_parameters=estim_parameters,
+                join_parameters=join_parameters,
+                model_parameters=model_parameters,
+                run_parameters=run_parameters,
+            )
+        from src.methods.data_ops_native import evaluate_joins_native
+
+        return evaluate_joins_native(
             scenario_logger=scenario_logger,
             base_table=base_table,
             join_candidates=join_candidates,
@@ -183,7 +215,23 @@ def evaluate_joins(
             model_parameters=model_parameters,
             run_parameters=run_parameters,
         )
+    finally:
+        if cache_dir is not None:
+            skrub.set_config(cache=None)
 
+
+def _evaluate_joins_legacy(
+    scenario_logger: ScenarioLogger,
+    base_table: pl.DataFrame,
+    join_candidates,
+    target_column: str = "target",
+    group_column: str = "col_to_embed",
+    estim_parameters: dict | None = None,
+    join_parameters: dict | None = None,
+    model_parameters: dict | None = None,
+    run_parameters: dict | None = None,
+):
+    """Legacy implementation of the evaluation loop."""
     splits = prepare_splits(run_parameters, base_table, group_column)
 
     estim_common_parameters = {

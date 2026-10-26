@@ -14,24 +14,69 @@ so that both engines share the exact same semantics.
 """
 
 import copy
+import logging
 import time
+from pathlib import Path
 
+import joblib
 import numpy as np
 import polars as pl
 import skrub
-from sklearn.model_selection import GroupShuffleSplit, ShuffleSplit, train_test_split
+from sklearn.model_selection import GroupShuffleSplit, ShuffleSplit
 from tqdm import tqdm
 
 import src.utils.joining as ju
 from src.data_structures.loggers import RunLogger
 from src.methods.evaluation import prepare_estimator, prepare_splits
-from src.methods.join_selectors import BaseJoinSelector
+from src.methods.model_core import EvalModel
+
+logger = logging.getLogger("data_ops_plan")
 
 # Durations of the calls to `_augment_all_candidates`. Functions are preserved
 # by `deepcopy` (used when skrub clones the plans), so this module-level list
 # is shared by all evaluations. The evaluation loop consumes it to report the
 # join durations as done by the legacy engine.
 _join_timings: list[float] = []
+
+
+def _save_artifacts(
+    scenario_logger,
+    estimator_name: str,
+    fold_id: int,
+    learner,
+    resolved: bool = False,
+):
+    """Save the computation graph and the fitted learner of a run.
+
+    Enabled by `run_parameters["save_artifacts"]`. The graph is written once
+    per estimator (the structure of the plan does not change across folds),
+    except when `resolved` is set (native `best_single_join`): the graph of
+    the winning candidate branch depends on the fold, so it is written per
+    fold. The fitted learner is overwritten at every fold, so the saved one
+    corresponds to the last successful fold; it can be re-applied to new data
+    with `learner.predict({"base_table": table})`.
+
+    Failures to save artifacts are logged as warnings and never interrupt the
+    evaluation.
+    """
+    try:
+        root = Path(f"results/logs/{scenario_logger.exp_name}")
+        graphs_dir = root / "graphs"
+        graphs_dir.mkdir(parents=True, exist_ok=True)
+        if resolved:
+            graph_path = graphs_dir / f"{estimator_name}_fold{fold_id}.svg"
+        else:
+            graph_path = graphs_dir / f"{estimator_name}.svg"
+        if not graph_path.exists():
+            drawing = learner.data_op.skb.draw_graph()
+            graph_path.write_bytes(drawing.svg)
+
+        learners_dir = root / "learners"
+        learners_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump(learner, learners_dir / f"{estimator_name}.joblib")
+        scenario_logger.learners[estimator_name] = learner
+    except Exception as exception:
+        logger.warning("Could not save artifacts for %s: %s", estimator_name, exception)
 
 
 class FrozenEstimator:
@@ -89,13 +134,20 @@ def _prepare_X(df: pl.DataFrame, target_column: str) -> pl.DataFrame:
     return df.drop(target_column)
 
 
-@skrub.deferred
-def _compute_groups(table: pl.DataFrame, group_column: str) -> np.ndarray:
+def _compute_groups_impl(table: pl.DataFrame, group_column: str) -> np.ndarray:
     """Compute the groups used by the GroupShuffleSplit, mirroring
-    `src.methods.evaluation.prepare_splits`."""
+    `src.methods.evaluation.prepare_splits`.
+
+    Note: the undecorated function is bound to its own module attribute
+    (instead of being shadowed by the deferred wrapper) so that plans
+    containing it can be pickled by reference.
+    """
     return table.select(
         pl.col(group_column).cast(pl.Categorical).to_physical().alias("group")
     ).to_numpy()
+
+
+_compute_groups = skrub.deferred(_compute_groups_impl)
 
 
 def _augment_all_candidates(
@@ -118,13 +170,55 @@ def _augment_all_candidates(
     return merged
 
 
-class ModelOnlySelector(BaseJoinSelector):
+def _aggregate_candidates(candidate_joins: dict, aggregation: str) -> dict:
+    """Aggregate every candidate table on its join key.
+
+    This operation depends only on the candidate tables and the aggregation
+    method, not on the base table: the resulting node is fold-independent and
+    its result can be cached (on disk with the skrub cache, or in memory)
+    across folds and runs. Only usable with the `first` and `mean`
+    aggregations, whose result per join key does not depend on the rows of
+    the left table (the `dfs` aggregation depends on the left table and must
+    stay fused with the join).
+
+    Returns:
+        dict: For each candidate hash, a tuple with the candidate metadata,
+        the aggregated table and the join keys.
+    """
+    aggregated = {}
+    for hash_, mdata in candidate_joins.items():
+        _, cnd_md, left_on, right_on = mdata.get_join_information()
+        cand_table = pl.read_parquet(cnd_md["full_path"])
+        aggr_table = ju.aggregate_table(cand_table, right_on, aggregation)
+        aggregated[hash_] = (mdata, aggr_table, left_on, right_on)
+    return aggregated
+
+
+def _join_aggregated(left_part: pl.DataFrame, aggregated: dict) -> pl.DataFrame:
+    """Join an (already aggregated) set of candidate tables onto a part of the
+    base table. Counterpart of `_aggregate_candidates`; mirrors the join order
+    and suffixes of `execute_join_all_candidates`."""
+    start = time.perf_counter()
+    merged = left_part.clone().lazy()
+    for hash_, (mdata, aggr_table, left_on, right_on) in aggregated.items():
+        merged = ju.execute_join(
+            merged,
+            aggr_table,
+            left_on=left_on,
+            right_on=right_on,
+            how="left",
+            suffix="_" + hash_[:10],
+        )
+    _join_timings.append(time.perf_counter() - start)
+    return merged
+
+
+class ModelOnlySelector(EvalModel):
     """Selector that relies on the DataOps plan for the join step.
 
     The base table provided at `fit` time is expected to be already augmented
-    by the DataOps plan. This class only takes care of splitting a validation
-    set and fitting/predicting with the model, mirroring the model-related
-    behavior of the legacy `FullJoin` estimator.
+    by the DataOps plan. The model logic (inner validation split, model
+    building and fitting) is inherited from `EvalModel`.
     """
 
     def __init__(
@@ -140,35 +234,10 @@ class ModelOnlySelector(BaseJoinSelector):
         self.name = name
         self.join_parameters = join_parameters if join_parameters is not None else {}
 
-    def fit(self, X, y):
-        self._start_time("prepare")
-        X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
-        self.n_joined_columns = len(X_train.columns)
-        self._end_time("prepare")
-
-        self._start_time("model_train")
-        self.build_model(X_train)
-        self.fit_model(X_train, y_train, validation_set=(X_valid, y_valid))
-        self._end_time("model_train")
-
-    def predict(self, X):
-        self._start_time("model_predict")
-        pred = self.predict_model(X)
-        self._end_time("model_predict")
-        return pred
-
     def get_estimator_parameters(self):
         d = super().get_estimator_parameters()
         d.update(self.join_parameters)
         return d
-
-    def get_additional_info(self):
-        return {
-            "best_candidate_hash": self.name,
-            "left_on": "",
-            "right_on": "",
-            "n_joined_columns": self.n_joined_columns,
-        }
 
 
 def _get_fitted_estimator(learner):
@@ -251,9 +320,10 @@ def build_plan(
         tuple: The DataOps plan and the environment expected by its methods.
     """
     target_column = run_parameters.get("target_column", "target")
+    use_cache = run_parameters.get("cache_dir") is not None
 
     base = skrub.var("base_table")
-    X = base.skb.apply_func(_prepare_X, target_column=target_column)
+    X = base.skb.apply_func(_prepare_X, target_column=target_column, no_cache=True)
     y = base[target_column]
 
     groups = _compute_groups(base, group_column)
@@ -265,11 +335,22 @@ def build_plan(
     if plan_native_join:
         if estimator.join_parameters["aggregation"] == "dfs":
             raise ValueError("Plan-native joins do not support the `dfs` aggregation.")
-        augmented = X.skb.apply_func(
-            _augment_all_candidates,
-            candidate_joins=estimator.candidate_joins,
-            aggregation=estimator.join_parameters["aggregation"],
-        )
+        if use_cache and estimator.join_parameters["aggregation"] in ("first", "mean"):
+            # Split aggregation and join: the aggregated candidates do not
+            # depend on the fold, so their computation can be cached across
+            # folds and runs.
+            aggregated = skrub.deferred(_aggregate_candidates)(
+                estimator.candidate_joins,
+                estimator.join_parameters["aggregation"],
+            )
+            augmented = X.skb.apply_func(_join_aggregated, aggregated, no_cache=True)
+        else:
+            augmented = X.skb.apply_func(
+                _augment_all_candidates,
+                candidate_joins=estimator.candidate_joins,
+                aggregation=estimator.join_parameters["aggregation"],
+                no_cache=True,
+            )
         model_selector = ModelOnlySelector(
             target_column=target_column,
             model_parameters=model_parameters,
@@ -277,10 +358,10 @@ def build_plan(
             name=estimator.name,
             join_parameters=estimator.join_parameters,
         )
-        pred = augmented.skb.apply(FrozenEstimator(model_selector), y=y)
+        pred = augmented.skb.apply(FrozenEstimator(model_selector), y=y, no_cache=True)
         environment = {"base_table": base_table}
     else:
-        pred = X.skb.apply(FrozenEstimator(estimator), y=y)
+        pred = X.skb.apply(FrozenEstimator(estimator), y=y, no_cache=True)
         environment = {"base_table": base_table}
 
     return pred, environment
@@ -330,6 +411,7 @@ def evaluate_joins_data_ops(
         estim for estim in estim_parameters if estim_parameters[estim]["active"]
     ]
     plan_native = run_parameters.get("plan_native_join", False)
+    save_artifacts = run_parameters.get("save_artifacts", False)
 
     for fold_id, split in tqdm(
         enumerate(splits),
@@ -433,6 +515,9 @@ def evaluate_joins_data_ops(
             res_list.append(curr_res)
             add_info_dict[f"{fold_id}_{estimator.name}"] = run_logger.additional_info
 
+            if save_artifacts:
+                _save_artifacts(scenario_logger, estimator.name, fold_id, learner)
+
     scenario_logger.additional_info = add_info_dict
     scenario_logger.results = pl.from_dicts(res_list)
     scenario_logger.print_results()
@@ -514,6 +599,7 @@ def evaluate_joins_light(
         raise ValueError("No active estimators were found.")
 
     res_frames = []
+    save_artifacts = run_parameters.get("save_artifacts", False)
     for estim_name in estimator_names:
         params = dict(estim_common_parameters)
         params.update(estim_parameters.get(estim_name, {}))
@@ -537,8 +623,15 @@ def evaluate_joins_light(
             estimator=estimator,
             splits=None,
         )
-        cv_results = pred.skb.cross_validate(environment=env, scoring=scoring)
+        cv_results = pred.skb.cross_validate(
+            environment=env, scoring=scoring, return_learner=save_artifacts
+        )
         res_frames.append(_cv_results_frame(cv_results, estimator.name, task))
+
+        if save_artifacts:
+            learners = cv_results["learner"]
+            for fold_id, learner in enumerate(learners):
+                _save_artifacts(scenario_logger, estimator.name, fold_id, learner)
 
     scenario_logger.results = pl.concat(res_frames, how="vertical")
     scenario_logger.print_results()

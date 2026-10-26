@@ -181,11 +181,22 @@ def validate_configuration(run_config: dict):
     assert run_parameters.get("engine", "legacy") in [
         "legacy",
         "data_ops",
+        "data_ops_native",
     ], f"Engine {run_parameters.get('engine', 'legacy')} not supported"
 
     assert run_parameters.get("plan_native_join", False) in [True, False]
 
     assert run_parameters.get("light", False) in [True, False]
+
+    assert run_parameters.get("save_artifacts", False) in [True, False]
+
+    assert run_parameters.get("cache_dir", None) is None or isinstance(
+        run_parameters.get("cache_dir"), str
+    ), "cache_dir must be a string path or None."
+
+    assert run_parameters.get("inner_cv_seed", None) is None or isinstance(
+        run_parameters.get("inner_cv_seed"), int
+    ), "inner_cv_seed must be an integer or None."
 
     assert run_parameters["debug"] in [True, False]
 
